@@ -227,4 +227,63 @@ describe('cache/redis', () => {
       errorSpy.mockRestore()
     }
   })
+
+  it('reindexFromEventLog and replayFailedEvent invalidate member and summary caches', async () => {
+    vi.doMock('../src/config.js', () => (
+      {
+        config: {
+          cache: { redisUrl: 'redis://fake:6379', memberCacheTtlSeconds: 30 },
+          stellar: { contractId: 'CTEST', contractIds: ['CTEST'] },
+        },
+      }
+    ))
+    const { getOrSetCache, membersListCacheKey, memberSummaryCacheKey } = await import('../src/cache/redis.js')
+    const { reindexFromEventLog } = await import('../src/indexer/reindex.js')
+    const { replayFailedEvent } = await import('../src/indexer/replay.js')
+    const { pool, query } = await import('../src/db/index.js')
+    const { decodedEvent } = await import('./fixtures.js')
+    const { resetDb } = await import('./db.js')
+
+    await resetDb()
+
+    // Populate cache entries
+    await getOrSetCache(membersListCacheKey(50), 30, vi.fn().mockResolvedValue([{ address: 'G1' }]))
+    const sumKey = memberSummaryCacheKey('G1')
+    await getOrSetCache(sumKey, 30, vi.fn().mockResolvedValue({ address: 'G1', joined: true }))
+
+    expect(store.has(membersListCacheKey(50))).toBe(true)
+    expect(store.has(sumKey)).toBe(true)
+
+    // Insert a dummy event so reindex has something to process
+    const ev = decodedEvent('joined', { member: 'G1', fee: '100' }, { id: '0000000001-000000-00000001', ledger: 1 })
+    await query(
+      `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash]
+    )
+
+    await reindexFromEventLog()
+    // reindexFromEventLog should invalidate members list cache
+    expect(store.has(membersListCacheKey(50))).toBe(false)
+
+    // Re-populate caches for replay test
+    await getOrSetCache(membersListCacheKey(50), 30, vi.fn().mockResolvedValue([{ address: 'G1' }]))
+    await getOrSetCache(sumKey, 30, vi.fn().mockResolvedValue({ address: 'G1', joined: true }))
+    expect(store.has(membersListCacheKey(50))).toBe(true)
+    expect(store.has(sumKey)).toBe(true)
+
+    // Insert a failed event record pointing to our event
+    await query(
+      `INSERT INTO failed_events (contract_id, event_id, symbol, ledger, error, resolved_at)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [ev.contractId, ev.id, ev.symbol, ev.ledger, 'some error']
+    )
+
+    const outcome = await replayFailedEvent(ev.id)
+    expect(outcome.status).toBe('replayed')
+
+    // replayFailedEvent should invalidate both members list cache and member summary cache for membership-modifying events ('joined')
+    expect(store.has(membersListCacheKey(50))).toBe(false)
+    expect(store.has(sumKey)).toBe(false)
+  })
 })
